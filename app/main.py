@@ -17,16 +17,19 @@ from .merge import merge
 from .navigate import navigate
 from .page_assets import page_assets
 from .replay import ReplayError, replay
+from .site_reachability import site_reachability
 from .snapshot_diff import snapshot_diff
 
 app = FastAPI(
     title="WARC Replay API",
-    version="1.9.0",
+    version="1.10.0",
     description="接收 Base64 编码的自包含 WARC：/v1/replay 还原 response/revisit "
     "记录，/v1/extract 按记录 ID 导出子集（含引用链传递依赖），"
     "/v1/navigate 按时点离线还原页面（跟随重定向），"
     "/v1/snapshot-diff 对比两份归档在同一时点各自可见的 URL，"
     "/v1/page-assets 检查该时点页面的静态资源能否从同包归档还原，"
+    "/v1/site-reachability 从首页按时点广度优先遍历，给出站内 HTML 页面"
+    "的可达性（最短点击次数与前驱）与不可达页面，"
     "/v1/digest-audit 逐条核验记录的 WARC-Block-Digest 与 "
     "WARC-Payload-Digest，/v1/capture-index 按（URL、UTC 时刻、归档序号）"
     "分页列出抓取及其在解压后归档中的字节范围，/v1/merge 将两份归档的 "
@@ -255,6 +258,56 @@ class PageAssetsResponse(BaseModel):
 @app.post("/v1/page-assets", response_model=PageAssetsResponse, status_code=200)
 async def post_page_assets(payload: PageAssetsRequest) -> dict[str, Any]:
     return page_assets(payload.warc, payload.url, payload.at)
+
+
+class SiteReachabilityRequest(BaseModel):
+    warc: str = Field(
+        ...,
+        description="Base64 编码的 WARC 数据（可带空白/换行），解码后不超过 2 MiB",
+    )
+    url: str = Field(..., description="首页（根）HTTP(S) URL（绝对地址）")
+    at: str = Field(
+        ...,
+        description="RFC3339 时点（建议 UTC，如 2021-05-05T10:00:00Z）",
+    )
+
+
+class ReachablePage(BaseModel):
+    record_id: str = Field(
+        ..., description="页面终点记录的 WARC-Record-ID 原始值"
+    )
+    min_clicks: int = Field(
+        ..., description="从首页到该页面的最短点击次数；首页为 0"
+    )
+    previous_url: Optional[str] = Field(
+        None,
+        description="最短路径上前驱页面的终点 URL；首页为 null",
+    )
+
+
+class UnreachablePage(BaseModel):
+    record_id: str = Field(
+        ..., description="该时点不可达的同源 HTML 页面终点记录 ID（原始值）"
+    )
+
+
+class SiteReachabilityResponse(BaseModel):
+    reachable: list[ReachablePage] = Field(
+        ...,
+        description="从首页可达的站内 HTML 页面（含首页），按广度优先首次"
+        "到达顺序（同层按 URL 排序）",
+    )
+    unreachable: list[UnreachablePage] = Field(
+        ...,
+        description="该时点归档中存在但无法从首页到达的同源 HTML 页面，"
+        "按记录 ID 排序",
+    )
+
+
+@app.post("/v1/site-reachability", response_model=SiteReachabilityResponse,
+          status_code=200)
+async def post_site_reachability(payload: SiteReachabilityRequest) -> dict[str, Any]:
+    return site_reachability(payload.warc, payload.url, payload.at)
 
 
 class DigestAuditRequest(BaseModel):

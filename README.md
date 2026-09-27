@@ -1,6 +1,6 @@
 # WARC Revisit Replay API
 
-基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供十个接口：
+基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供十一个接口：
 
 - `POST /v1/replay`：接收 Base64 编码的自包含 WARC，按 `WARC-Record-ID` 建索引，
   将 `revisit` 记录沿 `WARC-Refers-To` 引用链还原到终点 `response` 的正文；
@@ -12,6 +12,11 @@
   两份归档中各自可见的 URL（仅旧版 / 仅新版 / 内容变化 / 未变化）；
 - `POST /v1/page-assets`：接收 WARC、起始 URL 与时点，还原最终页面后逐项检查
   其静态资源（img/script/样式表）在该时点能否从同包归档还原；
+- `POST /v1/site-reachability`：接收 WARC、**首页 URL** 与时点，从首页终点起
+  按链接做**按 URL 排序的广度优先遍历**（去重防环），计算站内**同源**、终点
+  **2xx** 且 `Content-Type` 为 `text/html` 的页面可达性——返回每个可达页面的
+  记录 ID、**最短点击次数**与前驱 URL，以及该时点归档中存在但不可达的页面
+  记录 ID；
 - `POST /v1/digest-audit`：逐条核验 response/revisit 记录的
   `WARC-Block-Digest` 与 `WARC-Payload-Digest`（sha1/sha256 的无填充
   Base32 摘要），报告每项 absent / match / mismatch 与失配总数；
@@ -453,6 +458,90 @@ curl -s http://localhost:8000/v1/page-assets \
       "http_status": 200,
       "error": null
     }
+  ]
+}
+```
+
+### `POST /v1/site-reachability`
+
+在 `/v1/navigate` 的时点选取与重定向跟随之上，从**首页**出发计算站内 HTML
+页面的可达性。
+
+请求体（与 `/v1/navigate` 相同）：
+
+| 字段   | 类型   | 说明 |
+|--------|--------|------|
+| `warc` | string | **Base64 编码**的 WARC；解码后 **≤ 2 MiB**，支持 gzip（单流或多 member）。 |
+| `url`  | string | 首页（根）**HTTP(S)** 绝对 URL。 |
+| `at`   | string | **RFC3339** 时点，建议 UTC（如 `2021-05-05T10:00:00Z`）。 |
+
+页面节点与遍历规则：
+
+- 先按与 `/v1/navigate` **完全相同**的规则跟随首页重定向，得到**首页终点
+  URL**；站点的“源”以该终点为准（scheme + 主机 + 端口，默认端口归一）；
+- 每个 URL 取 `WARC-Date` 不晚于 `at` 的最新抓取（同刻取归档后者），重定向
+  规则（相对 `Location`、8 跳上限、成环检测等）与 `/v1/navigate` 一致；
+- **页面节点**必须同时满足：跟随重定向后的**终点 URL** 与首页终点**同源**、
+  终点记录自己的 HTTP 状态为 **2xx**、HTTP `Content-Type` 的**媒体类型**为
+  **`text/html`**（参数忽略、大小写不敏感，如 `Text/HTML; charset=utf-8`）；
+  正文使用 revisit 还原后的正文；
+- 从每个页面正文解析 `a[href]`：相对地址按**首个有效** `<base href>` 解析
+  （base 自身可相对本页解析，规则同 `/v1/page-assets`；无有效 base 用本页
+  URL），**去片段**；跨源与非 HTTP(S) 链接（`mailto:`、`javascript:` 等）
+  一律忽略；
+- **按 URL 排序做广度优先遍历**：每个页面的出链按绝对 URL 字典序入队，已入队
+  /已处理的链接与重定向途经 URL 全部去重，天然防环；每个节点记录**首次到达**
+  （BFS 即最短点击次数），前驱为上一层页面的终点 URL；首页为 **0 跳、无前驱**；
+- **子链接失败一律跳过**（不使请求失败）：时点前无抓取、重定向异常
+  （缺 Location / 目标非法 / 成环 / 超跳数）、终点非 2xx、非 `text/html`、
+  跨源，都不产生节点也不继续展开；
+- `unreachable`：枚举该时点归档中其余可独立跟随到的**同源 2xx HTML** 页面，
+  凡未被遍历到达者列入，只给记录 ID（按 ID 排序、去重）。
+
+首页（根）的致命错误：
+
+- 根 URL 在时点前无合格抓取 → **404** `capture_not_found`；
+- 根重定向错误（`missing_location` / `invalid_redirect_target` /
+  `redirect_cycle` / `too_many_redirects`）→ **422**，与 `/v1/navigate` 同；
+- 根终点非 2xx（含 revisit 自身无 HTTP 头、状态为 `null`）→ **422**
+  `status_not_2xx`；
+- 根终点 `Content-Type` 媒体类型不是 `text/html`（含缺该头）→ **422**
+  `not_html`。
+
+响应（`200`）：
+
+| 字段                          | 含义 |
+|-------------------------------|------|
+| `reachable`                   | 可达页面（**含首页**），按广度优先首次到达顺序排列（同层按 URL 排序） |
+| `reachable[].record_id`       | 页面**终点记录**的 `WARC-Record-ID` 原始值（revisit 为该 revisit 自身 ID） |
+| `reachable[].min_clicks`      | 从首页到该页面的**最短点击次数**；首页为 `0`（重定向不计点击） |
+| `reachable[].previous_url`    | 最短路径上**前驱页面**的终点 URL；首页为 `null` |
+| `unreachable`                 | 该时点归档中存在但无法从首页到达的同源 HTML 页面，按记录 ID 排序 |
+| `unreachable[].record_id`     | 不可达页面终点记录的 `WARC-Record-ID` 原始值 |
+
+#### 示例
+
+```bash
+curl -s http://localhost:8000/v1/site-reachability \
+  -H 'Content-Type: application/json' \
+  -d "{\"warc\":\"$(base64 -w0 sample.warc)\", \
+       \"url\":\"http://example.com/\", \
+       \"at\":\"2021-06-01T00:00:00Z\"}"
+```
+
+假设首页正文链接到 `/news` 与 `/about`，`/news` 又链接到 `/news/2`；另有
+`/secret` 在该时点有 200 HTML 抓取但没有任何页面链接到它：
+
+```json
+{
+  "reachable": [
+    {"record_id": "<urn:uuid:home>", "min_clicks": 0, "previous_url": null},
+    {"record_id": "<urn:uuid:about>", "min_clicks": 1, "previous_url": "http://example.com/"},
+    {"record_id": "<urn:uuid:news>", "min_clicks": 1, "previous_url": "http://example.com/"},
+    {"record_id": "<urn:uuid:news2>", "min_clicks": 2, "previous_url": "http://example.com/news"}
+  ],
+  "unreachable": [
+    {"record_id": "<urn:uuid:secret>"}
   ]
 }
 ```
@@ -1011,8 +1100,9 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 
 ## 错误处理（HTTP 422 / 404）
 
-输入与结构错误统一返回 **422**；`/v1/navigate` 与 `/v1/page-assets` 在某一跳
-无合格抓取时返回 **404**。响应体形如：
+输入与结构错误统一返回 **422**；`/v1/navigate`、`/v1/page-assets` 与
+`/v1/site-reachability` 在某一跳无合格抓取时返回 **404**（后两者仅**根页面**
+无抓取返回 404）。响应体形如：
 
 ```json
 {
@@ -1023,7 +1113,7 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 }
 ```
 
-十个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
+十一个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
 先旧后新；`/v1/merge` 同样对左、右两包各自独立校验，先左后右）：
 
 | `error`                        | 触发条件                                         | 附加字段 |
@@ -1069,11 +1159,12 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 | 422  | `invalid_cursor`       | `cursor` 不是合法的 Base64URL JSON、结构/版本非法、绑定的解压后归档 SHA-256 不符（跨包使用），或它指向的排序键在归档中不存在 | `reason`（`malformed` / `unsupported_version` / `archive_mismatch` / `stale_cursor`） |
 
 `/v1/navigate` 额外的错误（其中 `invalid_at`、`invalid_capture_date` 同样
-适用于 `/v1/snapshot-diff` 与 `/v1/page-assets`，`invalid_capture_date` 亦
-适用于 `/v1/capture-index`；snapshot-diff 不涉及重定向，也没有 404。
-`/v1/page-assets` 的**根页面**与 `/v1/navigate` 走同一套选取与
-重定向逻辑，下表错误全部原样适用；其**静态资源**的同类失败不会使整个请求
-失败，而是逐项标记在响应的 `assets[].error` 中）：
+适用于 `/v1/snapshot-diff`、`/v1/page-assets` 与 `/v1/site-reachability`，
+`invalid_capture_date` 亦适用于 `/v1/capture-index`；snapshot-diff 不涉及
+重定向，也没有 404。`/v1/page-assets` 的**根页面**与 `/v1/site-reachability`
+的**首页**均与 `/v1/navigate` 走同一套选取与重定向逻辑，下表错误全部原样
+适用；page-assets 的**静态资源**与 site-reachability 的**子链接**的同类失败
+不会使整个请求失败——前者逐项标记在 `assets[].error` 中，后者直接跳过）：
 
 | HTTP | `error`                   | 触发条件                                   | 附加字段 |
 |------|---------------------------|--------------------------------------------|----------|
@@ -1090,6 +1181,14 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 目标缺失时链尾为缺失的目标 ID，可同时通过 `missing_id` 获取。navigate 的
 `path` 给出截至出错时已选取的各跳（`url` / `record_id` / `capture_time` /
 `http_status`）。
+
+`/v1/site-reachability` 首页特有的错误（仅作用于**首页终点**；子链接的同类
+情况一律跳过，不报错；附加字段中的 `url` 为重定向后的首页终点 URL）：
+
+| HTTP | `error`           | 触发条件                                      | 附加字段 |
+|------|-------------------|-----------------------------------------------|----------|
+| 422  | `status_not_2xx`  | 首页终点记录自己的 HTTP 状态不是 2xx（含 revisit 自身无 HTTP 头、状态为 `null`） | `url`, `record_id`, `http_status` |
+| 422  | `not_html`        | 首页终点缺 HTTP `Content-Type` 头或其媒体类型不是 `text/html` | `url`, `record_id`, `content_type` |
 
 `/v1/merge` 额外的错误（左、右两包的解码与结构/引用链错误均为上表共用
 错误；请求模型还会校验 `left_warc` / `right_warc` 字段存在且为字符串）：
@@ -1139,6 +1238,7 @@ app/
   navigate.py      # /v1/navigate：时点选取、相对 Location 跟随、成环/跳数判定
   snapshot_diff.py # /v1/snapshot-diff：双归档时点快照与四类 URL 对比
   page_assets.py   # /v1/page-assets：HTML 静态资源提取与逐项可还原性检查
+  site_reachability.py # /v1/site-reachability：a[href] 解析、按 URL 排序的 BFS 与站内页面可达性
   digest_audit.py  # /v1/digest-audit：Block/Payload 摘要解析与逐条核验
   capture_index.py # /v1/capture-index：排序键分页、cursor 编解码与字节范围
   merge.py         # /v1/merge：双包原序合并、跨包冲突确定性改名与末记录补长
@@ -1150,6 +1250,7 @@ tests/
   test_navigate.py
   test_snapshot_diff.py
   test_page_assets.py
+  test_site_reachability.py
   test_digest_audit.py
   test_capture_index.py
   test_merge.py
