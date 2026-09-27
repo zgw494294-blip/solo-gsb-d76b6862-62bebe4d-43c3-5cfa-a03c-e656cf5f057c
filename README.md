@@ -1,6 +1,6 @@
 # WARC Revisit Replay API
 
-基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供十个接口：
+基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供十一个接口：
 
 - `POST /v1/replay`：接收 Base64 编码的自包含 WARC，按 `WARC-Record-ID` 建索引，
   将 `revisit` 记录沿 `WARC-Refers-To` 引用链还原到终点 `response` 的正文；
@@ -34,6 +34,10 @@
   `gzip_warc`（Base64）与各记录 ID 的压缩 `offset`/`length`（连续、互不
   重叠）；末记录缺 `Content-Length` 时补入准确块长，整包解压后交给
   `/v1/replay` 与输入一致，解压后超过 2 MiB 返回 422。
+- `POST /v1/site-reachability`：接收 Base64 WARC、首页 URL 与时点，从首页
+  出发沿 `a[href]` 链接广度优先遍历同源 `text/html` 页面，计算站内页面
+  可达性——可达节点的最短点击次数与前驱页面，以及归档中同源但无法到达
+  的 URL。
 
 ## 一条命令启动（端口 8000）
 
@@ -1009,10 +1013,141 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 # 把结果作为 warc 字段 POST 给 /v1/replay
 ```
 
+### `POST /v1/site-reachability`
+
+从**首页**出发沿 `a[href]` 链接广度优先遍历站内页面，计算归档中的站内
+页面**可达性**：哪些页面能从首页点击到达、最短需要几次点击、从哪个页面
+到达；哪些同源 URL 虽在归档中有时点前的抓取、却无法从首页到达。
+
+请求体（与 `/v1/navigate` 相同）：
+
+| 字段   | 类型   | 说明 |
+|--------|--------|------|
+| `warc` | string | **Base64 编码**的 WARC；解码后 **≤ 2 MiB**，支持 gzip（单流或多 member）。 |
+| `url`  | string | 首页 **HTTP(S)** 绝对 URL。 |
+| `at`   | string | **RFC3339** 时点，建议 UTC（如 `2021-05-05T10:00:00Z`）。 |
+
+遍历规则：
+
+- 每个 URL 的时点选取与重定向跟随与 `/v1/navigate` **完全相同**（截至时点
+  最新抓取、同刻取归档后者、跟随 301/302/303/307/308、相对 `Location`
+  解析、最多 8 跳、成环检测）；
+- **节点**为终点 URL 与首页终点**同源**（scheme、主机、端口一致，缺省
+  端口按 80/443 计）、记录自身 HTTP 状态为 **2xx**、且 HTTP `Content-Type`
+  的媒体类型为 `text/html` 的页面；站点源以**首页终点**（重定向跟随后的
+  最终 URL）为准——`http://` 首页 301 到 `https://` 之后，`https://`
+  下的页面才算站内；
+- 从节点的**还原正文**（revisit 已还原为链终点 response 的正文）提取
+  `a[href]`；相对地址按**首个有效** `<base href>` 解析（规则与
+  `/v1/page-assets` 相同），去掉片段，忽略跨源与非 HTTP(S) 链接
+  （`mailto:`、`javascript:` 等）；
+- 逐层**广度优先**：每层节点按终点 URL 字典序处理，已遇到的 URL 去重
+  防环；首页为第 0 层（0 次点击），重定向不计点击；同一页面被多条链接
+  指向时首次发现（即最短点击）生效，前驱为同层按 URL 排序先处理到的
+  页面；
+- **子链接的任何失败**（时点前无抓取、重定向异常、终点跨源/非 2xx/非
+  HTML）都只跳过该链接，不影响其余遍历；
+- 首页无合格抓取 → **404**；首页重定向异常、终点非 2xx 或媒体类型非
+  `text/html` → **422**（见错误处理一节）。
+
+响应（`200`）：
+
+| 字段                      | 含义 |
+|---------------------------|------|
+| `final_url`               | 首页终点 URL（站点源以它为准） |
+| `reachable`               | 可达节点，按遍历顺序（点击层数升序，同层按 URL 字典序）；每项见下 |
+| `reachable[].url`         | 页面终点 URL（重定向跟随后的同源终点） |
+| `reachable[].record_id`   | 终点记录的 `WARC-Record-ID` 原始值 |
+| `reachable[].clicks`      | 自首页起的最短点击次数（首页为 0） |
+| `reachable[].from`        | 前驱页面 URL（发现该页面的链接所在节点的终点 URL）；首页为 `null` |
+| `unreachable`             | 归档中同源、时点前有可见抓取、但遍历从未遇到的 URL，按 URL 字典序 |
+| `unreachable[].url`       | 不可达 URL（`WARC-Target-URI` 原值） |
+| `unreachable[].record_id` | 该 URL 在时点下选中记录的 `WARC-Record-ID` 原始值 |
+
+#### 示例
+
+造一份样例归档：首页链接 `/about` 与 `/old`（后者 301 到 `/about`），
+`/about` 再链接 `/team`；`/archive-only` 在归档中有点前抓取但无人链接：
+
+```bash
+python3 - <<'EOF' > sample-site.warc
+import sys
+
+def rec(rid, block, extra=b"", uri="http://example.com/",
+        date="2021-01-01T00:00:00Z"):
+    return (
+        f"WARC/1.1\r\nWARC-Type: response\r\nWARC-Record-ID: {rid}\r\n"
+        f"WARC-Date: {date}\r\nWARC-Target-URI: {uri}\r\n"
+        f"Content-Length: {len(block)}\r\n".encode()
+        + extra + b"\r\n" + block + b"\r\n\r\n"
+    )
+
+def http(body=b"", line="HTTP/1.1 200 OK", ctype="text/html", extra=b""):
+    h = line.encode() + b"\r\n"
+    if ctype:
+        h += f"Content-Type: {ctype}\r\n".encode()
+    return h + extra + b"\r\n" + body
+
+home = (b'<html><body><a href="/about">About</a>'
+        b'<a href="/old">Old</a></body></html>')
+about = b'<html><body><a href="/team">Team</a></body></html>'
+out = rec("<urn:uuid:home>", http(home))
+out += rec("<urn:uuid:about>", http(about), uri="http://example.com/about")
+out += rec("<urn:uuid:team>", http(b"<html>team</html>"),
+           uri="http://example.com/team")
+out += rec("<urn:uuid:old>", http(b"", "HTTP/1.1 301 Moved Permanently",
+           None, b"Location: /about\r\n"), uri="http://example.com/old")
+out += rec("<urn:uuid:lost>", http(b"<html>lost</html>"),
+           uri="http://example.com/archive-only")
+sys.stdout.buffer.write(out)
+EOF
+
+curl -s http://localhost:8000/v1/site-reachability \
+  -H 'Content-Type: application/json' \
+  -d "{\"warc\":\"$(base64 -w0 sample-site.warc)\", \
+       \"url\":\"http://example.com/\", \
+       \"at\":\"2021-06-01T00:00:00Z\"}"
+```
+
+响应（`/old` 被遍历遇到但只是重定向跳，既不是节点也不算不可达；
+`/archive-only` 从未被链接到达，列入 `unreachable`）：
+
+```json
+{
+  "final_url": "http://example.com/",
+  "reachable": [
+    {
+      "url": "http://example.com/",
+      "record_id": "<urn:uuid:home>",
+      "clicks": 0,
+      "from": null
+    },
+    {
+      "url": "http://example.com/about",
+      "record_id": "<urn:uuid:about>",
+      "clicks": 1,
+      "from": "http://example.com/"
+    },
+    {
+      "url": "http://example.com/team",
+      "record_id": "<urn:uuid:team>",
+      "clicks": 2,
+      "from": "http://example.com/about"
+    }
+  ],
+  "unreachable": [
+    {
+      "url": "http://example.com/archive-only",
+      "record_id": "<urn:uuid:lost>"
+    }
+  ]
+}
+```
+
 ## 错误处理（HTTP 422 / 404）
 
-输入与结构错误统一返回 **422**；`/v1/navigate` 与 `/v1/page-assets` 在某一跳
-无合格抓取时返回 **404**。响应体形如：
+输入与结构错误统一返回 **422**；`/v1/navigate`、`/v1/page-assets` 与
+`/v1/site-reachability` 在某一跳无合格抓取时返回 **404**。响应体形如：
 
 ```json
 {
@@ -1023,7 +1158,7 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 }
 ```
 
-十个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
+十一个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
 先旧后新；`/v1/merge` 同样对左、右两包各自独立校验，先左后右）：
 
 | `error`                        | 触发条件                                         | 附加字段 |
@@ -1069,11 +1204,14 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 | 422  | `invalid_cursor`       | `cursor` 不是合法的 Base64URL JSON、结构/版本非法、绑定的解压后归档 SHA-256 不符（跨包使用），或它指向的排序键在归档中不存在 | `reason`（`malformed` / `unsupported_version` / `archive_mismatch` / `stale_cursor`） |
 
 `/v1/navigate` 额外的错误（其中 `invalid_at`、`invalid_capture_date` 同样
-适用于 `/v1/snapshot-diff` 与 `/v1/page-assets`，`invalid_capture_date` 亦
-适用于 `/v1/capture-index`；snapshot-diff 不涉及重定向，也没有 404。
-`/v1/page-assets` 的**根页面**与 `/v1/navigate` 走同一套选取与
-重定向逻辑，下表错误全部原样适用；其**静态资源**的同类失败不会使整个请求
-失败，而是逐项标记在响应的 `assets[].error` 中）：
+适用于 `/v1/snapshot-diff`、`/v1/page-assets` 与 `/v1/site-reachability`，
+`invalid_capture_date` 亦适用于 `/v1/capture-index`；snapshot-diff 不涉及
+重定向，也没有 404。`/v1/page-assets` 的**根页面**与 `/v1/navigate` 走同一
+套选取与重定向逻辑，下表错误全部原样适用；其**静态资源**的同类失败不会
+使整个请求失败，而是逐项标记在响应的 `assets[].error` 中。
+`/v1/site-reachability` 的**首页**同样走这套选取与重定向逻辑，下表错误
+（含 404）原样适用，另加表末两个首页终点错误；其**子链接**的同类失败只
+被跳过，不影响遍历结果）：
 
 | HTTP | `error`                   | 触发条件                                   | 附加字段 |
 |------|---------------------------|--------------------------------------------|----------|
@@ -1085,6 +1223,8 @@ base64 -d <(echo '上面的 gzip_warc') | gzip -c -d | base64 -w0   # 解压后�
 | 422  | `redirect_cycle`          | 重定向 URL 成环                            | `url`, `path`（闭合到重复 URL） |
 | 422  | `too_many_redirects`      | 选取记录超过 8 跳                          | `url`, `next_url`, `max_hops`, `path` |
 | 404  | `capture_not_found`       | 某一跳 URL 在时点前没有合格抓取            | `url`, `at`, `path`（已走过的各跳） |
+| 422  | `root_status_not_2xx`     | 仅 `/v1/site-reachability`：首页终点记录自身的 HTTP 状态非 2xx（含 revisit 无 HTTP 头状态为 `null`） | `url`, `record_id`, `http_status`, `path` |
+| 422  | `root_not_html`           | 仅 `/v1/site-reachability`：首页终点的 HTTP `Content-Type` 媒体类型不是 `text/html`（含缺失） | `url`, `record_id`, `content_type`, `path` |
 
 `chain` 给出完整**引用链**（出错记录自身 ID 起，逐跳包含每个 `WARC-Refers-To`）；
 目标缺失时链尾为缺失的目标 ID，可同时通过 `missing_id` 获取。navigate 的
@@ -1144,6 +1284,7 @@ app/
   merge.py         # /v1/merge：双包原序合并、跨包冲突确定性改名与末记录补长
   http_exchanges.py# /v1/http-exchanges：WARC-Concurrent-To 显式配对与交换重建
   member_pack.py   # /v1/member-pack：逐记录独立 gzip member 打包、固定时间戳与定位范围
+  site_reachability.py # /v1/site-reachability：同源 HTML 页面 BFS、最短点击与不可达集合
 tests/
   test_replay.py
   test_extract.py
@@ -1155,6 +1296,7 @@ tests/
   test_merge.py
   test_http_exchanges.py
   test_member_pack.py
+  test_site_reachability.py
 Dockerfile
 docker-compose.yml
 requirements.txt

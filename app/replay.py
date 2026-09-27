@@ -64,6 +64,8 @@ class _RawRecord:
     body: bytes
     http_status: Optional[int]
     http_location: Optional[str] = None  # HTTP Location 头原始值（重定向用）
+    # HTTP Content-Type 头原始值（/v1/site-reachability 判定 text/html 用）
+    http_content_type: Optional[str] = None
     offset: int = 0
     body_source_id: Optional[str] = None  # 还原后正文来源记录 ID（原始字面值）
     # 记录在（解压后）归档字节流中的范围 (offset, length)：自 WARC 版本行起、
@@ -93,6 +95,7 @@ class ResolvedRecord:
     date: Optional[str]
     http_status: Optional[int]
     http_location: Optional[str]
+    http_content_type: Optional[str]
     body: bytes
     body_source_id: str
 
@@ -211,6 +214,20 @@ def _http_location_from(rec) -> Optional[str]:
         return None
     location = location.strip()
     return location or None
+
+
+def _http_content_type_from(rec) -> Optional[str]:
+    """提取 HTTP ``Content-Type`` 头原始值；无头/无该头/空值返回 None。"""
+    hh = rec.http_headers
+    if hh is None:
+        return None
+    if not str(getattr(hh, "protocol", "")).upper().startswith("HTTP/"):
+        return None
+    content_type = hh.get_header("Content-Type")
+    if content_type is None:
+        return None
+    content_type = content_type.strip()
+    return content_type or None
 
 
 def _all_headers(headers, name: str) -> list[str]:
@@ -572,6 +589,7 @@ def parse_warc(data: bytes, *, allow_missing_target_uri: bool = False,
                     body=body,
                     http_status=_http_status_from(rec),
                     http_location=_http_location_from(rec),
+                    http_content_type=_http_content_type_from(rec),
                     offset=offset,
                     span=span,
                     block_digest_raw=warc_headers.get_header("WARC-Block-Digest"),
@@ -740,6 +758,7 @@ def load_records(warc_b64: str, *, allow_missing_target_uri: bool = False
                 date=raw.date,
                 http_status=raw.http_status,
                 http_location=raw.http_location,
+                http_content_type=raw.http_content_type,
                 body=endpoint.body,
                 body_source_id=endpoint.record_id_raw,
             )

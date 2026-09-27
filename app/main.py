@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .capture_index import capture_index
 from .digest_audit import digest_audit
@@ -17,11 +17,12 @@ from .merge import merge
 from .navigate import navigate
 from .page_assets import page_assets
 from .replay import ReplayError, replay
+from .site_reachability import site_reachability
 from .snapshot_diff import snapshot_diff
 
 app = FastAPI(
     title="WARC Replay API",
-    version="1.9.0",
+    version="1.10.0",
     description="接收 Base64 编码的自包含 WARC：/v1/replay 还原 response/revisit "
     "记录，/v1/extract 按记录 ID 导出子集（含引用链传递依赖），"
     "/v1/navigate 按时点离线还原页面（跟随重定向），"
@@ -35,7 +36,9 @@ app = FastAPI(
     "侧的 WARC-Concurrent-To 显式关联重建 request 与 response/revisit 的 "
     "HTTP 交换（允许前向引用，URL/时间相同不配对），/v1/member-pack 把 "
     "response/revisit 记录按归档原序逐记录打成独立 gzip member，生成可按"
-    "记录定位的多 member gzip（固定 gzip 时间戳，输出确定）。",
+    "记录定位的多 member gzip（固定 gzip 时间戳，输出确定），"
+    "/v1/site-reachability 从首页出发按 a[href] 链接广度优先遍历同源 "
+    "text/html 页面，计算站内页面可达性（最短点击次数与前驱页面）。",
 )
 
 
@@ -463,3 +466,57 @@ class MemberPackResponse(BaseModel):
           status_code=200)
 async def post_member_pack(payload: MemberPackRequest) -> dict[str, Any]:
     return member_pack(payload.warc)
+
+
+class SiteReachabilityRequest(BaseModel):
+    warc: str = Field(
+        ...,
+        description="Base64 编码的 WARC 数据（可带空白/换行），解码后不超过 "
+        "2 MiB",
+    )
+    url: str = Field(..., description="首页 HTTP(S) URL（绝对地址）")
+    at: str = Field(
+        ...,
+        description="RFC3339 时点（建议 UTC，如 2021-05-05T10:00:00Z）",
+    )
+
+
+class SiteReachablePage(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    url: str = Field(..., description="页面终点 URL（重定向跟随后的同源终点）")
+    record_id: str = Field(..., description="终点记录的 WARC-Record-ID 原始值")
+    clicks: int = Field(
+        ..., description="自首页起的最短点击次数（首页为 0，重定向不计点击）"
+    )
+    from_: Optional[str] = Field(
+        None, alias="from",
+        description="前驱页面 URL（发现该页面的链接所在节点的终点 URL）；"
+        "首页为 null",
+    )
+
+
+class SiteUnreachablePage(BaseModel):
+    url: str = Field(..., description="归档中同源但遍历未遇到的 URL")
+    record_id: str = Field(
+        ..., description="该 URL 在时点下选中记录的 WARC-Record-ID 原始值"
+    )
+
+
+class SiteReachabilityResponse(BaseModel):
+    final_url: str = Field(
+        ..., description="首页终点 URL（根页面重定向跟随后的终点；站点源以它为准）"
+    )
+    reachable: list[SiteReachablePage] = Field(
+        ..., description="可达节点，按遍历顺序（点击层数升序，同层按 URL 字典序）"
+    )
+    unreachable: list[SiteUnreachablePage] = Field(
+        ..., description="不可达的同源归档 URL，按 URL 字典序"
+    )
+
+
+@app.post("/v1/site-reachability", response_model=SiteReachabilityResponse,
+          status_code=200)
+async def post_site_reachability(
+        payload: SiteReachabilityRequest) -> dict[str, Any]:
+    return site_reachability(payload.warc, payload.url, payload.at)
